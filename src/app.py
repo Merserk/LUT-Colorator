@@ -858,13 +858,6 @@ with gr.Blocks() as app:
                 outputs=[settings_status]
             )
             
-        # --- TAB 6: DOCUMENTATION ---
-        with gr.Tab("Documentation"):
-            with open(os.path.join(os.path.dirname(__file__), "README.md"), "r", encoding="utf-8") as f:
-                readme_content = f.read()
-            gr.Markdown(readme_content)
-
-
 if __name__ == "__main__":
     os.makedirs("output", exist_ok=True)
     print("Launching LUT Studio Generator...")
