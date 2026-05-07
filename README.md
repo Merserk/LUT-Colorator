@@ -276,3 +276,5 @@ Use **Stochastic Parametric** for fast, bold, highly varied creative looks. Use 
 Temporary LUT files are used to avoid Windows path-escaping problems during FFmpeg filter execution.
 
 ---
+
+*If LUT Colorator helps you build better looks faster, give the repository a star! ⭐*
