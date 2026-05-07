@@ -6,6 +6,8 @@ $BinDir = Join-Path $Root "bin"
 $DownloadDir = Join-Path $BinDir "_downloads"
 $Requirements = Join-Path $Root "requirements.txt"
 $PythonSeries = "3.13"
+$UvApi = "https://api.github.com/repos/astral-sh/uv/releases/latest"
+$UvFallbackUrl = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
 $GyanFfmpegApi = "https://api.github.com/repos/GyanD/codexffmpeg/releases/latest"
 $GyanFfmpegFallbackUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 
@@ -129,7 +131,68 @@ function Enable-PythonSite($PythonDir) {
     Set-Content -LiteralPath $pth.FullName -Value $updated -Encoding ASCII
 }
 
-function Install-PipAndRequirements($PythonDir) {
+function Get-PortableUv {
+    $uvExe = Join-Path $BinDir "uv\uv.exe"
+    if (Test-Path -LiteralPath $uvExe) {
+        Write-Step "Using existing portable uv"
+        $uvVersion = & $uvExe --version
+        Write-Host $uvVersion
+        return $uvExe
+    }
+
+    Write-Step "Installing portable uv"
+
+    $zipPath = Join-Path $DownloadDir "uv-x86_64-pc-windows-msvc.zip"
+    $extractDir = Join-Path $DownloadDir "uv_extract"
+    $uvDir = Join-Path $BinDir "uv"
+    $downloadUrl = $UvFallbackUrl
+
+    try {
+        Write-Host "Resolving latest astral-sh/uv release..."
+        $release = Invoke-RestMethod -Uri $UvApi -Headers @{ "User-Agent" = "LUT-Studio-Installer" }
+        $asset = $release.assets |
+            Where-Object { $_.name -eq "uv-x86_64-pc-windows-msvc.zip" } |
+            Select-Object -First 1
+
+        if ($asset -and $asset.browser_download_url) {
+            $downloadUrl = $asset.browser_download_url
+            Write-Host "Latest uv release: $($release.tag_name) / $($asset.name)"
+        } else {
+            Write-Host "Could not find uv Windows x64 ZIP asset in GitHub API response; using latest-download fallback." -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "Could not resolve uv GitHub release; using latest-download fallback." -ForegroundColor Yellow
+    }
+
+    Invoke-Download $downloadUrl $zipPath
+
+    if (Test-Path -LiteralPath $extractDir) {
+        Remove-Item -LiteralPath $extractDir -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $extractDir | Out-Null
+    Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
+
+    $downloadedUv = Get-ChildItem -LiteralPath $extractDir -Recurse -File -Filter "uv.exe" | Select-Object -First 1
+    if (-not $downloadedUv) {
+        throw "uv archive did not contain uv.exe."
+    }
+
+    if (Test-Path -LiteralPath $uvDir) {
+        Remove-Item -LiteralPath $uvDir -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $uvDir | Out-Null
+    Copy-Item -LiteralPath $downloadedUv.FullName -Destination $uvExe -Force
+
+    $uvVersion = & $uvExe --version
+    if ($LASTEXITCODE -ne 0) {
+        throw "uv verification failed."
+    }
+    Write-Host $uvVersion
+
+    return $uvExe
+}
+
+function Install-UvRequirements($PythonDir) {
     $pythonExe = Join-Path $PythonDir "python.exe"
     if (-not (Test-Path -LiteralPath $pythonExe)) {
         throw "python.exe was not found in $PythonDir"
@@ -138,33 +201,12 @@ function Install-PipAndRequirements($PythonDir) {
         throw "requirements.txt was not found at $Requirements"
     }
 
-    Write-Step "Bootstrapping pip"
-    $pipOk = $false
-    try {
-        & $pythonExe -m pip --version > $null 2>&1
-        $pipOk = ($LASTEXITCODE -eq 0)
-    } catch {
-        $pipOk = $false
-    }
+    $uvExe = Get-PortableUv
 
-    if (-not $pipOk) {
-        $getPip = Join-Path $DownloadDir "get-pip.py"
-        Invoke-Download "https://bootstrap.pypa.io/get-pip.py" $getPip
-        & $pythonExe $getPip --no-warn-script-location
-        if ($LASTEXITCODE -ne 0) {
-            throw "get-pip.py failed."
-        }
-    }
-
-    Write-Step "Installing pip packages from requirements.txt"
-    & $pythonExe -m pip install --upgrade --no-warn-script-location pip setuptools wheel
+    Write-Step "Installing Python packages with uv"
+    & $uvExe pip install --python "$pythonExe" --upgrade --requirement "$Requirements"
     if ($LASTEXITCODE -ne 0) {
-        throw "pip upgrade failed."
-    }
-
-    & $pythonExe -m pip install --upgrade --prefer-binary --no-warn-script-location -r $Requirements
-    if ($LASTEXITCODE -ne 0) {
-        throw "requirements install failed."
+        throw "uv requirements install failed."
     }
 }
 
@@ -220,6 +262,7 @@ function Test-Install($PythonDir) {
     Write-Step "Verifying install"
 
     $pythonExe = Join-Path $PythonDir "python.exe"
+    $uvExe = Join-Path $BinDir "uv\uv.exe"
     $ffmpegExe = Join-Path $BinDir "ffmpeg\ffmpeg.exe"
     $ffprobeExe = Join-Path $BinDir "ffmpeg\ffprobe.exe"
 
@@ -228,9 +271,9 @@ function Test-Install($PythonDir) {
         throw "Python package verification failed."
     }
 
-    & $pythonExe -m pip check
+    & $uvExe pip check --python "$pythonExe"
     if ($LASTEXITCODE -ne 0) {
-        throw "pip dependency check failed."
+        throw "uv dependency check failed."
     }
 
     & $pythonExe -c "from importlib.metadata import version; from pathlib import Path; req=Path(r'$Requirements'); ok=True; lines=[line.strip() for line in req.read_text().splitlines() if line.strip() and not line.strip().startswith('#')];`nfor line in lines:`n    name, expected = line.split('==', 1); actual = version(name); print(f'{name}=={actual}'); ok = ok and actual == expected`nraise SystemExit(0 if ok else 1)"
@@ -251,14 +294,22 @@ function Test-Install($PythonDir) {
     Write-Host $ffprobeVersion[0]
 }
 
+function Clear-DownloadCache {
+    if (Test-Path -LiteralPath $DownloadDir) {
+        Write-Step "Cleaning temporary downloads"
+        Remove-Item -LiteralPath $DownloadDir -Recurse -Force
+    }
+}
+
 New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
 New-Item -ItemType Directory -Path $DownloadDir -Force | Out-Null
 
 $pythonDir = Get-PortablePython
 Enable-PythonSite $pythonDir
-Install-PipAndRequirements $pythonDir
+Install-UvRequirements $pythonDir
 Install-PortableFfmpeg
 Test-Install $pythonDir
+Clear-DownloadCache
 
 Write-Host ""
 Write-Host "Portable runtime is ready." -ForegroundColor Green
