@@ -8,8 +8,7 @@ $Requirements = Join-Path $Root "requirements.txt"
 $PythonSeries = "3.13"
 $UvApi = "https://api.github.com/repos/astral-sh/uv/releases/latest"
 $UvFallbackUrl = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
-$GyanFfmpegApi = "https://api.github.com/repos/GyanD/codexffmpeg/releases/latest"
-$GyanFfmpegFallbackUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+$GyanFfmpegLatestUrl = "https://github.com/GyanD/codexffmpeg/releases/latest"
 
 function Write-Step($Message) {
     Write-Host ""
@@ -192,6 +191,36 @@ function Get-PortableUv {
     return $uvExe
 }
 
+function Get-GitHubLatestReleaseTag($LatestUrl) {
+    $request = [System.Net.HttpWebRequest]::Create($LatestUrl)
+    $request.Method = "HEAD"
+    $request.AllowAutoRedirect = $false
+    $request.UserAgent = "LUT-Studio-Installer"
+
+    $response = $null
+    try {
+        $response = $request.GetResponse()
+        $location = $response.Headers["Location"]
+    } catch [System.Net.WebException] {
+        if ($_.Exception.Response) {
+            $response = $_.Exception.Response
+            $location = $response.Headers["Location"]
+        } else {
+            throw
+        }
+    } finally {
+        if ($response) {
+            $response.Close()
+        }
+    }
+
+    if ($location -and $location -match "/releases/tag/([^/?#]+)") {
+        return $Matches[1]
+    }
+
+    throw "Could not resolve latest GitHub release tag from $LatestUrl"
+}
+
 function Install-UvRequirements($PythonDir) {
     $pythonExe = Join-Path $PythonDir "python.exe"
     if (-not (Test-Path -LiteralPath $pythonExe)) {
@@ -211,28 +240,20 @@ function Install-UvRequirements($PythonDir) {
 }
 
 function Install-PortableFfmpeg {
-    Write-Step "Installing latest Gyan.dev release FFmpeg"
+    Write-Step "Installing latest GyanD/codexffmpeg GitHub release FFmpeg"
 
     $ffmpegDir = Join-Path $BinDir "ffmpeg"
     $zipPath = Join-Path $DownloadDir "ffmpeg-latest-win64.zip"
     $extractDir = Join-Path $DownloadDir "ffmpeg_extract"
-    $downloadUrl = $GyanFfmpegFallbackUrl
 
     try {
-        Write-Host "Resolving latest GyanD/codexffmpeg release..."
-        $release = Invoke-RestMethod -Uri $GyanFfmpegApi -Headers @{ "User-Agent" = "LUT-Studio-Installer" }
-        $asset = $release.assets |
-            Where-Object { $_.name -match '^ffmpeg-.+-essentials_build\.zip$' } |
-            Select-Object -First 1
-
-        if ($asset -and $asset.browser_download_url) {
-            $downloadUrl = $asset.browser_download_url
-            Write-Host "Latest release: $($release.tag_name) / $($asset.name)"
-        } else {
-            Write-Host "Could not find essentials ZIP asset in GitHub API response; using gyan.dev fallback." -ForegroundColor Yellow
-        }
+        Write-Host "Resolving latest GyanD/codexffmpeg GitHub release..."
+        $tag = Get-GitHubLatestReleaseTag $GyanFfmpegLatestUrl
+        $assetName = "ffmpeg-$tag-essentials_build.zip"
+        $downloadUrl = "https://github.com/GyanD/codexffmpeg/releases/download/$tag/$assetName"
+        Write-Host "Latest release: $tag / $assetName"
     } catch {
-        Write-Host "Could not resolve GitHub release; using gyan.dev fallback." -ForegroundColor Yellow
+        throw "Could not resolve latest GyanD/codexffmpeg GitHub release. $($_.Exception.Message)"
     }
 
     Invoke-Download $downloadUrl $zipPath
