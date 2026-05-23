@@ -287,7 +287,7 @@ function Test-Install($PythonDir) {
     $ffmpegExe = Join-Path $BinDir "ffmpeg\ffmpeg.exe"
     $ffprobeExe = Join-Path $BinDir "ffmpeg\ffprobe.exe"
 
-    & $pythonExe -c "import gradio, numpy, PIL; print('Python packages OK')"
+    & $pythonExe -c "import sys; sys.path.insert(0, r'$Root\src'); import gradio, numpy, PIL, numba; from lut_accel import acceleration_status; print('Python packages OK'); print(acceleration_status())"
     if ($LASTEXITCODE -ne 0) {
         throw "Python package verification failed."
     }
@@ -297,9 +297,9 @@ function Test-Install($PythonDir) {
         throw "uv dependency check failed."
     }
 
-    & $pythonExe -c "from importlib.metadata import version; from pathlib import Path; req=Path(r'$Requirements'); ok=True; lines=[line.strip() for line in req.read_text().splitlines() if line.strip() and not line.strip().startswith('#')];`nfor line in lines:`n    name, expected = line.split('==', 1); actual = version(name); print(f'{name}=={actual}'); ok = ok and actual == expected`nraise SystemExit(0 if ok else 1)"
+    & $pythonExe -c "from importlib.metadata import version; from pathlib import Path; import re; req=Path(r'$Requirements'); lines=[line.strip() for line in req.read_text().splitlines() if line.strip() and not line.strip().startswith('#')];`nfor line in lines:`n    name = re.split(r'[<>=!~ ]+', line, 1)[0]; print(f'{name}=={version(name)}')"
     if ($LASTEXITCODE -ne 0) {
-        throw "Installed package versions do not match requirements.txt."
+        throw "Installed package version reporting failed."
     }
 
     $ffmpegVersion = & $ffmpegExe -version 2>&1

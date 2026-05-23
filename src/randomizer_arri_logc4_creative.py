@@ -7,19 +7,6 @@ from typing import Optional, Tuple
 import numpy as np
 
 from lut_common import apply_lut_trilinear, apply_lut_uint8, create_identity_cube, ensure_dir
-from lut_accel import (
-    lift_gamma_gain_fast,
-    linear_to_srgb_fast,
-    log_contrast_scurve_fast,
-    logc4_decode_fast,
-    logc4_encode_fast,
-    saturation_fast,
-    soft_clip_fast,
-    split_tone_fast,
-    srgb_to_linear_fast,
-    temperature_fast,
-    vibrance_fast,
-)
 
 
 # ============================================================
@@ -46,9 +33,6 @@ def _safe_exp2(x: np.ndarray) -> np.ndarray:
 
 def srgb_to_linear(srgb: np.ndarray) -> np.ndarray:
     """sRGB (0..1) -> linear (0..1), float32."""
-    accelerated = srgb_to_linear_fast(srgb)
-    if accelerated is not None:
-        return accelerated.astype(np.float32, copy=False)
     x = _f32(srgb)
     a = np.float32(0.055)
     t = np.float32(0.04045)
@@ -58,9 +42,6 @@ def srgb_to_linear(srgb: np.ndarray) -> np.ndarray:
 
 def linear_to_srgb(lin: np.ndarray) -> np.ndarray:
     """Linear (0..1) -> sRGB (0..1), float32."""
-    accelerated = linear_to_srgb_fast(lin)
-    if accelerated is not None:
-        return accelerated.astype(np.float32, copy=False)
     x = _f32(lin)
     a = np.float32(0.055)
     t = np.float32(0.0031308)
@@ -73,83 +54,107 @@ def linear_to_srgb(lin: np.ndarray) -> np.ndarray:
 #                    ARRI LogC4-style Curve
 # ============================================================
 
-
 @dataclass(frozen=True)
 class LogC4Params:
     """
-    Official ARRI LogC4 transfer-function constants.
+    LogC4-style piecewise curve parameters.
 
-    ARRI's software implementation defines the normalized LogC4 curve as:
+    Encoding (linear -> log):
+      if x <= cut:
+          y = e*x + f
+      else:
+          y = a*log2(b*x + c) + d
 
-      encode(x):
-        (x - t) / s                                      if x < t
-        ((log2(a*x + 64) - 6) / 14) * b + c             otherwise
+    Decoding (log -> linear):
+      if y <= e*cut + f:
+          x = (y - f)/e
+      else:
+          x = (2^((y - d)/a) - c)/b
 
-      decode(y):
-        y * s + t                                       if y < 0
-        (2**(14 * (y - c) / b + 6) - 64) / a            otherwise
-
-    The constants are from ARRI LogC4 Specification, 23 Jan 2025.
+    For strict ARRI conformance, set parameters from the official ARRI LogC4 PDF.
     """
-
     a: np.float32
     b: np.float32
     c: np.float32
-    s: np.float32
-    t: np.float32
+    d: np.float32
+    cut: np.float32
+    e: np.float32
+    f: np.float32
 
-    @property
-    def stop_offset(self) -> np.float32:
-        """Approximate normalized LogC4 code-value offset for one exposure stop."""
-        return (self.b / np.float32(14.0)).astype(np.float32)
+    @staticmethod
+    def from_abcd_cut(a: float, b: float, c: float, d: float, cut: float) -> "LogC4Params":
+        """
+        Convenience constructor: computes toe line (e,f) by matching continuity and slope
+        at the cut point (C1 continuity).
+        """
+        a = np.float32(a); b = np.float32(b); c = np.float32(c); d = np.float32(d); cut = np.float32(cut)
+
+        # y_cut on the log segment
+        y_cut = (a * _safe_log2(b * cut + c) + d).astype(np.float32)
+
+        # derivative of log segment at cut:
+        # dy/dx = a * (b / (ln(2) * (b*x + c)))
+        ln2 = np.float32(np.log(2.0))
+        e = (a * (b / (ln2 * (b * cut + c)))).astype(np.float32)
+
+        # f to ensure continuity
+        f = (y_cut - e * cut).astype(np.float32)
+
+        return LogC4Params(a=a, b=b, c=c, d=d, cut=cut, e=e, f=f)
 
 
 class LogC4Curve:
-    """Official ARRI LogC4 encoder/decoder operating on float32 arrays."""
+    """
+    LogC4-style encoder/decoder operating on float32 arrays.
+
+    Note: This is a "LogC4 form" implementation; supply official parameters for strict match.
+    """
 
     def __init__(self, params: Optional[LogC4Params] = None):
         self.params = params if params is not None else default_logc4_params()
 
+        # Precompute cut in encoded domain for decode branch
+        self._y_cut = (self.params.e * self.params.cut + self.params.f).astype(np.float32)
+
     def encode(self, linear: np.ndarray) -> np.ndarray:
-        """Relative scene-linear -> normalized ARRI LogC4."""
+        """Scene-linear -> LogC4-like (float32)."""
         p = self.params
-        accelerated = logc4_encode_fast(linear, float(p.a), float(p.b), float(p.c), float(p.s), float(p.t))
-        if accelerated is not None:
-            return accelerated.astype(np.float32, copy=False)
         x = _f32(linear)
 
-        # Official LogC4 negative handling uses a mirrored linear toe below t.
-        y_toe = ((x - p.t) / p.s).astype(np.float32)
-        y_log = (((_safe_log2(p.a * x + np.float32(64.0)) - np.float32(6.0)) /
-                  np.float32(14.0)) * p.b + p.c).astype(np.float32)
-        return np.where(x < p.t, y_toe, y_log).astype(np.float32)
+        # Allow negative input but push it into toe safely
+        x = np.maximum(x, np.float32(0.0), dtype=np.float32)
+
+        y_toe = (p.e * x + p.f).astype(np.float32)
+        y_log = (p.a * _safe_log2(p.b * x + p.c) + p.d).astype(np.float32)
+        return np.where(x <= p.cut, y_toe, y_log).astype(np.float32)
 
     def decode(self, logv: np.ndarray) -> np.ndarray:
-        """Normalized ARRI LogC4 -> relative scene-linear."""
+        """LogC4-like -> scene-linear (float32)."""
         p = self.params
-        accelerated = logc4_decode_fast(logv, float(p.a), float(p.b), float(p.c), float(p.s), float(p.t))
-        if accelerated is not None:
-            return accelerated.astype(np.float32, copy=False)
         y = _f32(logv)
 
-        x_toe = (y * p.s + p.t).astype(np.float32)
-        power = (np.float32(14.0) * (y - p.c) / p.b + np.float32(6.0)).astype(np.float32)
-        x_log = ((_safe_exp2(power) - np.float32(64.0)) / p.a).astype(np.float32)
-        return np.where(y < np.float32(0.0), x_toe, x_log).astype(np.float32)
-
-    def mid_gray_code_value(self) -> np.float32:
-        """ARRI LogC4 normalized code value for 18% relative scene-linear gray."""
-        return self.encode(np.array(0.18, dtype=np.float32)).astype(np.float32)
+        x_toe = (y - p.f) / p.e
+        x_log = (_safe_exp2((y - p.d) / p.a) - p.c) / p.b
+        x = np.where(y <= self._y_cut, x_toe, x_log).astype(np.float32)
+        return np.maximum(x, np.float32(0.0), dtype=np.float32)
 
 
 def default_logc4_params() -> LogC4Params:
-    """Return official ARRI LogC4 constants from the 2025 ARRI specification."""
-    a = np.float32((2.0 ** 18.0 - 16.0) / 117.45)
-    b = np.float32((1023.0 - 95.0) / 1023.0)
-    c = np.float32(95.0 / 1023.0)
-    s = np.float32((7.0 * np.log(2.0) * (2.0 ** (7.0 - 14.0 * c / b))) / (a * b))
-    t = np.float32(((2.0 ** (14.0 * (-c / b) + 6.0)) - 64.0) / a)
-    return LogC4Params(a=a, b=b, c=c, s=s, t=t)
+    """
+    Default parameters for creative LUT generation.
+
+    The functional form matches ARRI LogC4 (log2 + toe). These values are a robust
+    "LogC-like" starting point. Replace with official LogC4 parameters for exact matching.
+    """
+    # Base constants close to common LogC-style behavior, but using log2.
+    # You can replace these directly with ARRI LogC4 table values:
+    # (a, b, c, d, cut) then e,f are derived automatically.
+    a = 0.0744   # ~= 0.24719 / log2(10)  (scales log2 similar to older log10 form)
+    b = 5.5556
+    c = 0.0523
+    d = 0.3855
+    cut = 0.0106
+    return LogC4Params.from_abcd_cut(a=a, b=b, c=c, d=d, cut=cut)
 
 
 # ============================================================
@@ -159,7 +164,7 @@ def default_logc4_params() -> LogC4Params:
 class LUTRandomizerPro:
     """
     Generates creative LUT cubes using:
-    - Linear cube -> official ARRI LogC4 domain
+    - Linear cube -> LogC4-like domain
     - Apply look operations in log domain
     - Convert back to linear, clamp 0..1
     """
@@ -189,9 +194,6 @@ class LUTRandomizerPro:
         Pivot-preserving contrast using Tanh logic.
         Ensures f(pivot) = pivot.
         """
-        accelerated = log_contrast_scurve_fast(log_cube, amount, pivot)
-        if accelerated is not None:
-            return accelerated.astype(np.float32, copy=False)
         x = log_cube.astype(np.float32, copy=False)
         p = np.float32(pivot)
         
@@ -231,17 +233,14 @@ class LUTRandomizerPro:
         """
         # A stop in log2 corresponds to +1 before scaling; our log encoding scales by 'a'.
         # We approximate exposure as an offset proportional to stops.
-        # In LogC4's logarithmic region, one exposure stop is approximately b/14.
-        off = np.float32(stops) * self.log.params.stop_offset
+        # Using params.a: y = a*log2(...) + d  -> one stop ~= +a
+        off = np.float32(stops) * self.log.params.a
         return (log_cube + off).astype(np.float32)
 
     def _apply_saturation(self, lin_cube: np.ndarray, sat_mult: float) -> np.ndarray:
         """
         Saturation in linear RGB via luma interpolation.
         """
-        accelerated = saturation_fast(lin_cube, sat_mult)
-        if accelerated is not None:
-            return accelerated.astype(np.float32, copy=False)
         x = lin_cube.astype(np.float32, copy=False)
         lum = self._luma(x)
         lum3 = np.stack([lum, lum, lum], axis=-1).astype(np.float32)
@@ -253,9 +252,6 @@ class LUTRandomizerPro:
         """
         Vibrance: boost saturation more in low-sat regions.
         """
-        accelerated = vibrance_fast(lin_cube, vib)
-        if accelerated is not None:
-            return accelerated.astype(np.float32, copy=False)
         x = lin_cube.astype(np.float32, copy=False)
         vib = np.float32(vib)
 
@@ -279,18 +275,6 @@ class LUTRandomizerPro:
         """
         Split tone in linear domain using luma-based masks.
         """
-        accelerated = split_tone_fast(
-            lin_cube,
-            shadow_rgb,
-            highlight_rgb,
-            strength,
-            shadow_mul=1.6,
-            highlight_mul=1.6,
-            highlight_off=0.6,
-            clip_output=False,
-        )
-        if accelerated is not None:
-            return accelerated.astype(np.float32, copy=False)
         x = lin_cube.astype(np.float32, copy=False)
         lum = self._luma(x)
 
@@ -317,9 +301,6 @@ class LUTRandomizerPro:
         if np.isclose(t, 0.0):
             return x
 
-        accelerated = temperature_fast(x, float(t), warm=(1.08, 1.00, 0.93), cool=(0.93, 1.00, 1.08))
-        if accelerated is not None:
-            return accelerated.astype(np.float32, copy=False)
         warm = _f32([1.08, 1.00, 0.93])
         cool = _f32([0.93, 1.00, 1.08])
         filt = warm if t > 0 else cool
@@ -332,17 +313,6 @@ class LUTRandomizerPro:
         """
         Lift/Gamma/Gain in linear space.
         """
-        accelerated = lift_gamma_gain_fast(
-            lin_cube,
-            lift,
-            gamma,
-            gain,
-            min_value=1e-6,
-            max_value=32.0,
-            clip_output=False,
-        )
-        if accelerated is not None:
-            return accelerated.astype(np.float32, copy=False)
         x = lin_cube.astype(np.float32, copy=False)
         lift = np.float32(lift)
         gamma = np.float32(max(gamma, 1e-4))
@@ -357,9 +327,6 @@ class LUTRandomizerPro:
         """
         Gentle highlight rolloff in linear domain.
         """
-        accelerated = soft_clip_fast(lin_cube, knee=knee, strength=strength)
-        if accelerated is not None:
-            return accelerated.astype(np.float32, copy=False)
         x = lin_cube.astype(np.float32, copy=False)
         k = np.float32(knee)
         s = np.float32(np.clip(strength, 0.0, 1.0))
@@ -377,7 +344,7 @@ class LUTRandomizerPro:
     def generate_unique_lut(self, style: str = "Cinematic") -> np.ndarray:
         """
         Returns LUT cube float32 in sRGB 0..1 domain (ready for display/save by 3D LUT tools).
-        Pipeline: Identity(sRGB) -> Linear -> official ARRI LogC4 -> Looks -> Linear -> sRGB.
+        Pipeline: Identity(sRGB) -> Linear -> LogC4 -> Looks -> Linear -> sRGB.
         """
         # 1. Start with sRGB Identity (0..1)
         srgb = self.identity.copy()
@@ -385,15 +352,16 @@ class LUTRandomizerPro:
         # 2. Convert sRGB -> Linear (Mid Grey 0.18 is now ~0.18 linear)
         lin = srgb_to_linear(srgb)
 
-        # 3. Convert Linear -> official ARRI LogC4 working domain
-        # 18% relative scene-linear maps to the LogC4 mid-gray code value.
+        # 3. Convert Linear -> LogC4-like working domain
+        # (Mid Grey 0.18 linear maps to ~0.39 in LogC4)
         logc = self.log.encode(lin)
 
         # Subtle global exposure variance (sensor drift)
         logc = self._apply_exposure_log(logc, stops=self.rng.uniform(-0.10, 0.10))
 
-        # Pivot for contrast around official LogC4 18% mid-gray (~0.2784).
-        MID_GREY_LOG = float(self.log.mid_gray_code_value())
+        # Pivot for contrast: Mid Grey in LogC4 is approx 0.39.
+        # We pivot around this to avoid lifting shadows/mids unnecessarily.
+        MID_GREY_LOG = 0.39
 
         # Style logic
         s = style or "Random"
@@ -539,7 +507,7 @@ class LUTRandomizerPro:
 
         # 4. Convert Linear -> sRGB (for display)
         # We must return sRGB values because the app expects the LUT to map sRGB->sRGB
-        srgb_out = linear_to_srgb(np.clip(lin, np.float32(0.0), np.float32(1.0)))
+        srgb_out = linear_to_srgb(lin)
 
         return _clip01(srgb_out)
 
